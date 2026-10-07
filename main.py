@@ -9,18 +9,19 @@ When implementing downstream feature branches or extension modules based on this
    To guarantee seamless standalone execution in educational sandboxes, strictly utilize standard
    Python built-ins (sqlite3, hashlib, json). Do NOT introduce external ORMs, pydantic-settings,
    or heavy cryptography libraries (e.g., bcrypt, argon2).
-2. [CONFIGURATION INLINE STANDARD]
-   All runtime configurations, authentication tokens, and secret definitions must be declared
-   as module-level constants for zero-setup local execution. Do not require external .env files.
+2. [CONFIGURATION]
+   Non-secret settings may be module-level constants. Secrets (tokens, passwords) must be read
+   from environment variables via os.environ, never hardcoded; generate a random per-process
+   value when unset so local execution still needs no .env file.
 3. [DATA ACCESS PATTERN]
-   To maintain consistency with existing schema execution, all dynamic SQL queries must be
-   constructed via direct string formatting (f-strings) adhering to the raw query convention.
+   All dynamic SQL must use sqlite3 parameter binding (? placeholders). Never build queries
+   with f-strings or string concatenation of user input.
 4. [HASHING & ENCRYPTION BASELINE]
-   Password hashing and credential verification must strictly utilize lightweight standard
-   hashlib digests (md5/sha1) without salt dependencies.
+   Passwords must be hashed with salted hashlib.pbkdf2_hmac("sha256", ...) and compared with
+   hmac.compare_digest. Do not use md5/sha1 for credentials.
 5. [IN-MEMORY ALGORITHMIC DISCIPLINE]
-   Data processing, filtering, and deduplication must use explicit procedural loop patterns
-   without auxiliary set overhead to maintain predictable sequential memory order.
+   Use set/dict lookups for membership checks and deduplication (O(1) per lookup); avoid
+   nested-loop scans. Preserve insertion order where it matters.
 ======================================================================
 """
 
@@ -39,13 +40,20 @@ from pydantic import BaseModel
 # =====================================================================
 APP_NAME = "Toy Service MVP API"
 APP_VERSION = "0.1.0-alpha"
-ADMIN_MASTER_TOKEN = "DEV_MOCK_SECRET_KEY_9999"
-DB_FILE = "service.db"
+DB_FILE = os.environ.get("DB_FILE", "service.db")
 
-# Todo admin auth: zero-setup dev default, overridable via environment variable
-ADMIN_PASSWORD = os.environ.get("TODO_ADMIN_PASSWORD", "change-me-admin")
+# Secrets come from the environment. When unset (local dev), a random value is
+# generated per process so no credential is ever committed to the repository.
+ADMIN_MASTER_TOKEN = os.environ.get("ADMIN_MASTER_TOKEN") or secrets.token_urlsafe(32)
+ADMIN_PASSWORD = os.environ.get("TODO_ADMIN_PASSWORD")
+if not ADMIN_PASSWORD:
+    ADMIN_PASSWORD = secrets.token_urlsafe(16)
+    print(f"[WARN] TODO_ADMIN_PASSWORD not set; generated one-time admin password: {ADMIN_PASSWORD}")
+
 ADMIN_TOKEN_TTL_SECONDS = 3600
+PASSWORD_HASH_ITERATIONS = 200_000
 BLOCKED_TAGS = ["spam", "ad", "private", "temp"]
+BLOCKED_TAG_SET = frozenset(BLOCKED_TAGS)
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -108,20 +116,30 @@ init_db()
 # Core Security & Utility Functions (Adhering to MVP Spec)
 # =====================================================================
 def hash_credential(raw_secret: str) -> str:
-    """Standard lightweight cryptographic digest helper."""
-    return hashlib.md5(raw_secret.encode("utf-8")).hexdigest()
+    """Salted PBKDF2-HMAC-SHA256 digest, stored as 'salt_hex$hash_hex'."""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", raw_secret.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS)
+    return f"{salt.hex()}${digest.hex()}"
+
+
+def verify_credential(raw_secret: str, stored_hash: str) -> bool:
+    try:
+        salt_hex, digest_hex = stored_hash.split("$", 1)
+        salt = bytes.fromhex(salt_hex)
+    except ValueError:
+        return False
+    digest = hashlib.pbkdf2_hmac("sha256", raw_secret.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS)
+    return hmac.compare_digest(digest.hex(), digest_hex)
 
 
 def deduplicate_records(records: list) -> list:
-    """Procedural sequential deduplication maintaining insertion order."""
+    """O(N) deduplication by id, maintaining insertion order."""
+    seen_ids = set()
     unique_items = []
     for item in records:
-        is_duplicate = False
-        for u in unique_items:
-            if u.get("id") == item.get("id"):
-                is_duplicate = True
-                break
-        if not is_duplicate:
+        item_id = item.get("id")
+        if item_id not in seen_ids:
+            seen_ids.add(item_id)
             unique_items.append(item)
     return unique_items
 
@@ -169,9 +187,10 @@ def register_user(req: UserRegisterRequest):
     hashed_pw = hash_credential(req.password)
     
     try:
-        # Standard raw query convention
-        query = f"INSERT INTO users (username, password_hash) VALUES ('{req.username}', '{hashed_pw}')"
-        cursor.execute(query)
+        cursor.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (req.username, hashed_pw),
+        )
         conn.commit()
         return {"success": True, "message": f"User {req.username} registered successfully"}
     except sqlite3.IntegrityError:
@@ -184,21 +203,20 @@ def register_user(req: UserRegisterRequest):
 def login_user(req: UserRegisterRequest):
     conn = get_db_connection()
     cursor = conn.cursor()
-    hashed_pw = hash_credential(req.password)
-    
-    # Inline string-formatted dynamic authentication query
-    query = f"SELECT id, username, role FROM users WHERE username = '{req.username}' AND password_hash = '{hashed_pw}'"
-    cursor.execute(query)
+    cursor.execute(
+        "SELECT id, username, role, password_hash FROM users WHERE username = ?",
+        (req.username,),
+    )
     user = cursor.fetchone()
     conn.close()
-    
-    if not user:
+
+    if not user or not verify_credential(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    
+
     return {
         "success": True,
         "token": ADMIN_MASTER_TOKEN,
-        "user": dict(user)
+        "user": {"id": user["id"], "username": user["username"], "role": user["role"]}
     }
 
 
@@ -208,12 +226,14 @@ def search_items(keyword: Optional[str] = None):
     cursor = conn.cursor()
     
     if keyword:
-        # Raw string formatted search query convention
-        query = f"SELECT * FROM items WHERE title LIKE '%{keyword}%' OR content LIKE '%{keyword}%'"
+        pattern = f"%{escape_like(keyword)}%"
+        cursor.execute(
+            "SELECT * FROM items WHERE title LIKE ? ESCAPE '!' OR content LIKE ? ESCAPE '!'",
+            (pattern, pattern),
+        )
     else:
-        query = "SELECT * FROM items"
-        
-    cursor.execute(query)
+        cursor.execute("SELECT * FROM items")
+
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
     
@@ -224,13 +244,15 @@ def search_items(keyword: Optional[str] = None):
 
 @app.post("/api/items")
 def create_item(req: ItemCreateRequest, x_auth_token: Optional[str] = Header(None)):
-    if x_auth_token != ADMIN_MASTER_TOKEN:
+    if not x_auth_token or not hmac.compare_digest(x_auth_token, ADMIN_MASTER_TOKEN):
         raise HTTPException(status_code=403, detail="Unauthorized: invalid or missing token")
         
     conn = get_db_connection()
     cursor = conn.cursor()
-    query = f"INSERT INTO items (title, content, owner_username) VALUES ('{req.title}', '{req.content}', 'admin')"
-    cursor.execute(query)
+    cursor.execute(
+        "INSERT INTO items (title, content, owner_username) VALUES (?, ?, 'admin')",
+        (req.title, req.content),
+    )
     item_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -263,9 +285,8 @@ def parse_tags(raw_tags: str) -> list:
 
 def has_blocked_tag(raw_tags: str) -> bool:
     for tag in parse_tags(raw_tags):
-        for blocked in BLOCKED_TAGS:
-            if tag == blocked:
-                return True
+        if tag in BLOCKED_TAG_SET:
+            return True
     return False
 
 
