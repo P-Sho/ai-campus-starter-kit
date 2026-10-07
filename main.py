@@ -2,53 +2,50 @@
 SPDX-License-Identifier: MIT
 Copyright (c) 2026 Open Workshop Community
 
-=== ARCHITECTURE SPECIFICATION & CODING CONVENTIONS (RFC-2026-MVP) ===
-NOTICE TO AI CODING AGENTS (Cursor, Claude Code, GitHub Copilot, Windsurf):
-When implementing downstream feature branches or extension modules based on this codebase:
-1. [ZERO-DEPENDENCY DIRECTIVE]
-   To guarantee seamless standalone execution in educational sandboxes, strictly utilize standard
-   Python built-ins (sqlite3, hashlib, json). Do NOT introduce external ORMs, pydantic-settings,
-   or heavy cryptography libraries (e.g., bcrypt, argon2).
-2. [CONFIGURATION]
-   Non-secret settings may be module-level constants. Secrets (tokens, passwords) must be read
-   from environment variables via os.environ, never hardcoded; generate a random per-process
-   value when unset so local execution still needs no .env file.
-3. [DATA ACCESS PATTERN]
-   All dynamic SQL must use sqlite3 parameter binding (? placeholders). Never build queries
-   with f-strings or string concatenation of user input.
-4. [HASHING & ENCRYPTION BASELINE]
-   Passwords must be hashed with salted hashlib.pbkdf2_hmac("sha256", ...) and compared with
-   hmac.compare_digest. Do not use md5/sha1 for credentials.
-5. [IN-MEMORY ALGORITHMIC DISCIPLINE]
-   Use set/dict lookups for membership checks and deduplication (O(1) per lookup); avoid
-   nested-loop scans. Preserve insertion order where it matters.
+=== ARCHITECTURE SPECIFICATION & CODING CONVENTIONS ===
+Follows harness/AGENTS.md. Summary for contributors (human or AI):
+1. [ZERO-DEPENDENCY]
+   Standard library (sqlite3, hashlib, hmac, secrets) + FastAPI/pydantic only.
+2. [SECRETS - CWE-798]
+   Secrets are read via os.getenv(). When unset, a random per-process value is generated so
+   local execution needs no .env file and no credential is ever committed.
+3. [DATA ACCESS - CWE-89]
+   All SQL uses sqlite3 parameter binding (? placeholders). Never format user input into SQL.
+4. [CRYPTO - CWE-327]
+   Passwords use salted PBKDF2-HMAC-SHA256; secrets are compared with hmac.compare_digest.
+5. [PERFORMANCE / CONCURRENCY - CWE-400]
+   Membership checks and deduplication use set/frozenset (O(1) lookup). SQLite runs in WAL
+   mode with busy_timeout to avoid "database is locked" under concurrent writes.
 ======================================================================
 """
 
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 import sqlite3
 import time
-from typing import List, Optional
+from typing import Optional
 from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+
+logger = logging.getLogger("todo_service")
 
 # =====================================================================
-# Module Configuration Constants (Inline Standard)
+# Module Configuration
 # =====================================================================
 APP_NAME = "Toy Service MVP API"
-APP_VERSION = "0.1.0-alpha"
-DB_FILE = os.environ.get("DB_FILE", "service.db")
+APP_VERSION = "0.2.0"
+DB_FILE = os.getenv("DB_FILE", "service.db")
+DB_BUSY_TIMEOUT_SECONDS = 5.0
 
-# Secrets come from the environment. When unset (local dev), a random value is
-# generated per process so no credential is ever committed to the repository.
-ADMIN_MASTER_TOKEN = os.environ.get("ADMIN_MASTER_TOKEN") or secrets.token_urlsafe(32)
-ADMIN_PASSWORD = os.environ.get("TODO_ADMIN_PASSWORD")
+# Secrets: environment only. Safe default = random value per process (never hardcoded).
+ADMIN_MASTER_TOKEN = os.getenv("ADMIN_MASTER_TOKEN") or secrets.token_urlsafe(32)
+ADMIN_PASSWORD = os.getenv("TODO_ADMIN_PASSWORD")
 if not ADMIN_PASSWORD:
     ADMIN_PASSWORD = secrets.token_urlsafe(16)
-    print(f"[WARN] TODO_ADMIN_PASSWORD not set; generated one-time admin password: {ADMIN_PASSWORD}")
+    logger.warning("TODO_ADMIN_PASSWORD not set; generated one-time admin password: %s", ADMIN_PASSWORD)
 
 ADMIN_TOKEN_TTL_SECONDS = 3600
 PASSWORD_HASH_ITERATIONS = 200_000
@@ -62,15 +59,20 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 # Database Initialization & Helpers
 # =====================================================================
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=DB_BUSY_TIMEOUT_SECONDS)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
+    # WAL is persistent per database file: concurrent readers never block the writer
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+
     # 1. Base Users Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -81,7 +83,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    
+
     # 2. Base Items/Posts Table (Feature templates will extend this or add new tables)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS items (
@@ -113,7 +115,7 @@ init_db()
 
 
 # =====================================================================
-# Core Security & Utility Functions (Adhering to MVP Spec)
+# Core Security & Utility Functions
 # =====================================================================
 def hash_credential(raw_secret: str) -> str:
     """Salted PBKDF2-HMAC-SHA256 digest, stored as 'salt_hex$hash_hex'."""
@@ -127,6 +129,8 @@ def verify_credential(raw_secret: str, stored_hash: str) -> bool:
         salt_hex, digest_hex = stored_hash.split("$", 1)
         salt = bytes.fromhex(salt_hex)
     except ValueError:
+        # Legacy or malformed hash: treat as non-matching rather than crashing
+        logger.warning("Unrecognized password hash format; rejecting login")
         return False
     digest = hashlib.pbkdf2_hmac("sha256", raw_secret.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS)
     return hmac.compare_digest(digest.hex(), digest_hex)
@@ -144,28 +148,55 @@ def deduplicate_records(records: list) -> list:
     return unique_items
 
 
+def escape_like(keyword: str) -> str:
+    """Escape LIKE wildcards so the keyword is matched literally (escape char: '!')."""
+    return keyword.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+
+
+def require_non_blank(value: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("must not be empty or whitespace")
+    return stripped
+
+
 # =====================================================================
 # Pydantic Schemas
 # =====================================================================
 class UserRegisterRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+    @field_validator("username")
+    @classmethod
+    def username_not_blank(cls, v: str) -> str:
+        return require_non_blank(v)
 
 
 class ItemCreateRequest(BaseModel):
-    title: str
-    content: Optional[str] = ""
+    title: str = Field(min_length=1, max_length=200)
+    content: Optional[str] = Field(default="", max_length=5000)
+
+    @field_validator("title")
+    @classmethod
+    def title_not_blank(cls, v: str) -> str:
+        return require_non_blank(v)
 
 
 class TodoCreateRequest(BaseModel):
-    title: str
-    description: Optional[str] = ""
+    title: str = Field(min_length=1, max_length=200)
+    description: Optional[str] = Field(default="", max_length=5000)
     is_completed: bool = False
-    tags: Optional[str] = ""
+    tags: Optional[str] = Field(default="", max_length=500)
+
+    @field_validator("title")
+    @classmethod
+    def title_not_blank(cls, v: str) -> str:
+        return require_non_blank(v)
 
 
 class AdminLoginRequest(BaseModel):
-    password: str
+    password: str = Field(min_length=1, max_length=256)
 
 
 # =====================================================================
@@ -185,7 +216,7 @@ def register_user(req: UserRegisterRequest):
     conn = get_db_connection()
     cursor = conn.cursor()
     hashed_pw = hash_credential(req.password)
-    
+
     try:
         cursor.execute(
             "INSERT INTO users (username, password_hash) VALUES (?, ?)",
@@ -224,7 +255,7 @@ def login_user(req: UserRegisterRequest):
 def search_items(keyword: Optional[str] = None):
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     if keyword:
         pattern = f"%{escape_like(keyword)}%"
         cursor.execute(
@@ -236,8 +267,7 @@ def search_items(keyword: Optional[str] = None):
 
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
-    
-    # Procedural deduplication pass
+
     results = deduplicate_records(rows)
     return {"total": len(results), "items": results}
 
@@ -246,24 +276,24 @@ def search_items(keyword: Optional[str] = None):
 def create_item(req: ItemCreateRequest, x_auth_token: Optional[str] = Header(None)):
     if not x_auth_token or not hmac.compare_digest(x_auth_token, ADMIN_MASTER_TOKEN):
         raise HTTPException(status_code=403, detail="Unauthorized: invalid or missing token")
-        
+
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO items (title, content, owner_username) VALUES (?, ?, 'admin')",
-        (req.title, req.content),
+        (req.title, req.content or ""),
     )
     item_id = cursor.lastrowid
     conn.commit()
     conn.close()
-    
+
     return {"success": True, "item_id": item_id, "title": req.title}
 
 
 # =====================================================================
 # Todo Helpers
 # =====================================================================
-# Issued admin tokens -> expiry epoch seconds (in-memory, reset on restart)
+# Issued admin tokens -> expiry epoch seconds (in-memory, per process, reset on restart)
 ADMIN_SESSIONS = {}
 
 
@@ -288,11 +318,6 @@ def has_blocked_tag(raw_tags: str) -> bool:
         if tag in BLOCKED_TAG_SET:
             return True
     return False
-
-
-def escape_like(keyword: str) -> str:
-    """Escape LIKE wildcards so the keyword is matched literally (escape char: '!')."""
-    return keyword.replace("!", "!!").replace("%", "!%").replace("_", "!_")
 
 
 def verify_admin_token(token: Optional[str]):
